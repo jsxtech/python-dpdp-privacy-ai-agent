@@ -1,0 +1,11 @@
+{
+  "storage_path": "data/dpdp_storage.json",
+  "breach_threshold": 5,
+  "default_retention_days": 365,
+  "log_level": "INFO",
+  "api": {
+    "host": "0.0.0.0",
+    "port": 5000,
+    "debug": false
+  }
+}
