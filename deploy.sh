@@ -4,23 +4,27 @@
 
 echo "Starting DPDP Privacy Agent deployment..."
 
+# Validate required environment variables
+if [ -z "$DPDP_API_KEY" ]; then
+    echo "ERROR: DPDP_API_KEY environment variable is required."
+    echo "Set it with: export DPDP_API_KEY=your-secure-api-key"
+    exit 1
+fi
+
+if [ -z "$DPDP_ENCRYPTION_KEY" ]; then
+    echo "ERROR: DPDP_ENCRYPTION_KEY environment variable is required."
+    echo "Generate one with: python -c \"from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())\""
+    exit 1
+fi
+
 # Create necessary directories
 mkdir -p data logs
 
 # Install dependencies
 pip install -r requirements.txt
 
-# Set API key (change this in production!)
-export DPDP_API_KEY="${DPDP_API_KEY:-dev-key-change-in-production}"
-
-# Set encryption key (IMPORTANT: Save this key securely!)
-if [ -z "$DPDP_ENCRYPTION_KEY" ]; then
-    echo "WARNING: No DPDP_ENCRYPTION_KEY set. Generating new key..."
-    echo "IMPORTANT: Save the encryption key from logs for data recovery!"
-fi
-
-echo "API Key: $DPDP_API_KEY"
-echo "IMPORTANT: Set DPDP_API_KEY and DPDP_ENCRYPTION_KEY environment variables in production!"
+echo "Environment variables validated."
+echo "IMPORTANT: Keep your encryption key secure. Without it, encrypted data cannot be recovered."
 
 # Run API server
 echo "Starting API server on port 5000..."
