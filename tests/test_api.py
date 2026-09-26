@@ -59,6 +59,19 @@ def test_wrong_content_type_415(client):
     assert resp.status_code == 415
 
 
+@pytest.mark.parametrize("body", [5, 3.14, "a string", [1, 2, 3], True])
+def test_non_object_json_body_returns_400(client, body):
+    # A valid-JSON but non-object body must be rejected with 400, never 500.
+    resp = client.post("/consent/grant", json=body, headers=_auth())
+    assert resp.status_code == 400
+
+
+def test_null_json_body_returns_400(client):
+    resp = client.post("/consent/grant", data="null",
+                       content_type="application/json", headers=_auth())
+    assert resp.status_code == 400
+
+
 def test_grant_consent_and_store_flow(client):
     r = client.post("/consent/grant",
                     json={"user_id": "u1", "purpose": "marketing"}, headers=_auth())
