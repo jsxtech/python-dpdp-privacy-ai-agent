@@ -598,12 +598,15 @@ class DPDPAgent:
         try:
             with self._lock:
                 deleted = 0
+                now = datetime.now()
                 for user_id in list(self.data_store.keys()):
                     items = self.data_store[user_id]
-                    expired = [i for i in items if
-                               datetime.now() > i.created_at + timedelta(days=i.retention_days)]
-                    deleted += len(expired)
-                    remaining = [i for i in items if i not in expired]
+                    remaining = []
+                    for item in items:
+                        if now > item.created_at + timedelta(days=item.retention_days):
+                            deleted += 1
+                        else:
+                            remaining.append(item)
                     if remaining:
                         self.data_store[user_id] = remaining
                     else:
@@ -626,12 +629,18 @@ class DPDPAgent:
 
             with self._lock:
                 count = 0
-                if user_id in self.data_store:
+                had_data = user_id in self.data_store
+                had_consents = user_id in self.consents
+                if had_data:
                     count = len(self.data_store[user_id])
                     del self.data_store[user_id]
-                    self._log_action(user_id, "data_erased", "ALL", f"{count} items deleted")
-                if user_id in self.consents:
+                if had_consents:
                     del self.consents[user_id]
+                # Always record an audit entry for a DPDP erasure request, even when the
+                # user only had consent records (or nothing) so the request is traceable.
+                self._log_action(user_id, "data_erased", "ALL",
+                                 f"{count} data items deleted; "
+                                 f"consents_removed={had_consents}")
                 self._save_state()
 
             logger.info("Right to erasure executed for user %s, %d items deleted",
@@ -706,7 +715,10 @@ class DPDPAgent:
             has_consent = self.check_consent(user_id, purpose)
             risk = self.assess_risk(category, has_consent)
 
-            if self.detect_breach_attempt(user_id):
+            # Breach heuristic applies only to callers WITHOUT valid consent. A user who
+            # holds current consent for this purpose is legitimate and must not be locked
+            # out by earlier blocked attempts (e.g. requests made before granting consent).
+            if not has_consent and self.detect_breach_attempt(user_id):
                 with self._lock:
                     self._log_action(user_id, "breach_detected", category.value, "blocked")
                     self._save_state()
