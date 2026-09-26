@@ -174,7 +174,39 @@ Edit `config.json`:
 
 Logs are written to:
 - Console (stdout)
-- `dpdp_agent.log` file
+- A log file (default `dpdp_agent.log` in the working directory)
+
+Set `DPDP_LOG_FILE` to change the log path, e.g. `export DPDP_LOG_FILE=logs/dpdp_agent.log`.
+The deployment script sets this to `logs/dpdp_agent.log` automatically.
+
+## Environment Variables
+
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `DPDP_API_KEY` | Yes | API key for authenticating requests (`X-API-Key` header). |
+| `DPDP_ENCRYPTION_KEY` | Yes | Encryption key. A 44-char base64 Fernet key is used directly; any other value is treated as a passphrase and a key is derived via PBKDF2. |
+| `DPDP_TRUSTED_PROXIES` | No (default `1`) | Number of trusted reverse-proxy hops. Enables `ProxyFix` so rate limiting keys on the real client IP via `X-Forwarded-For`. Set to `0` when not behind a proxy. |
+| `DPDP_LOG_FILE` | No | Path to the log file. Defaults to `dpdp_agent.log`. |
+
+**Encryption key note:** Prefer a proper 44-char Fernet key in production. When a passphrase is
+used instead, a random per-deployment salt is generated and stored next to the data file (e.g.
+`data/dpdp_storage.salt`). Back up this salt file — without it, passphrase-derived data cannot be
+decrypted. Existing deployments that predate the salt file fall back to a legacy salt for
+backward compatibility.
+
+## Testing
+
+```bash
+pip install pytest
+pytest
+```
+
+## Running Behind a Reverse Proxy
+
+Rate limiting is keyed on the client IP. When deployed behind nginx/caddy, set
+`DPDP_TRUSTED_PROXIES` to the number of proxy hops so the real client IP is read from
+`X-Forwarded-For`. Only enable this when you control the proxy, as forwarded headers can be
+spoofed by untrusted clients.
 
 ## License
 
