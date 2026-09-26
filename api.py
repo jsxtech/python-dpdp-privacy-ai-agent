@@ -17,9 +17,17 @@ from datetime import datetime, timedelta
 from functools import wraps
 
 from flask import Flask, request, jsonify
+from werkzeug.middleware.proxy_fix import ProxyFix
 from dpdp_agent import DPDPAgent
 
 app = Flask(__name__)
+
+# Trust reverse-proxy forwarded headers so rate limiting keys on the real client IP.
+# Only enable when actually behind a trusted proxy; the number of trusted proxy
+# hops is configurable via DPDP_TRUSTED_PROXIES (default 1). Set to 0 to disable.
+_trusted_proxies = int(os.environ.get('DPDP_TRUSTED_PROXIES', '1'))
+if _trusted_proxies > 0:
+    app.wsgi_app = ProxyFix(app.wsgi_app, x_for=_trusted_proxies, x_proto=_trusted_proxies)
 
 # Load config
 config = {}
@@ -27,9 +35,19 @@ if os.path.exists('config.json'):
     with open('config.json') as f:
         config = json.load(f)
 
-# Initialize agent with config
+# Encryption key - refuse to start without it (mirror DPDP_API_KEY handling)
+ENCRYPTION_KEY = os.environ.get('DPDP_ENCRYPTION_KEY')
+if not ENCRYPTION_KEY:
+    raise RuntimeError(
+        "DPDP_ENCRYPTION_KEY environment variable is required. "
+        "Generate one with: "
+        "python -c \"from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())\""
+    )
+
+# Initialize agent with config and explicit encryption key
 agent = DPDPAgent(
     storage_path=config.get('storage_path'),
+    encryption_key=ENCRYPTION_KEY,
     config_path='config.json'
 )
 
@@ -127,6 +145,12 @@ def handle_validation_error(e):
     return jsonify({"error": str(e)}), 400
 
 
+@app.errorhandler(PermissionError)
+def handle_permission_error(e):
+    # DPDP consent violations surface as 403 rather than a generic 500.
+    return jsonify({"error": str(e)}), 403
+
+
 @app.errorhandler(Exception)
 def handle_error(e):
     logging.error(f"API Error: {e}")
@@ -178,15 +202,12 @@ def store_data():
     if not data or 'user_id' not in data or 'text' not in data:
         return jsonify({"error": "user_id and text required"}), 400
 
-    try:
-        agent.store_data(
-            data['user_id'],
-            data['text'],
-            data.get('retention_days'),
-            data.get('purpose')
-        )
-    except PermissionError as e:
-        return jsonify({"error": str(e)}), 403
+    agent.store_data(
+        data['user_id'],
+        data['text'],
+        data.get('retention_days'),
+        data.get('purpose')
+    )
 
     return jsonify({"status": "success"}), 201
 
