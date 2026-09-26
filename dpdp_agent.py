@@ -20,7 +20,13 @@ logger.setLevel(logging.INFO)
 
 # Module-specific handlers (don't pollute root logger for library consumers)
 _formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-_file_handler = logging.FileHandler('dpdp_agent.log')
+# Log file path is configurable via DPDP_LOG_FILE so deployments can direct logs
+# into a dedicated directory (e.g. logs/dpdp_agent.log). Defaults to CWD.
+_log_file = os.environ.get('DPDP_LOG_FILE', 'dpdp_agent.log')
+_log_dir = os.path.dirname(_log_file)
+if _log_dir:
+    os.makedirs(_log_dir, exist_ok=True)
+_file_handler = logging.FileHandler(_log_file)
 _file_handler.setFormatter(_formatter)
 logger.addHandler(_file_handler)
 _stream_handler = logging.StreamHandler()
@@ -165,9 +171,9 @@ class DPDPAgent:
             except Exception:
                 pass  # Fall through to KDF
 
-        # Otherwise, derive a key using PBKDF2
+        # Otherwise, derive a key using PBKDF2 with a per-deployment random salt.
         logger.info("Deriving encryption key from passphrase using PBKDF2")
-        salt = b'dpdp-privacy-agent-v1-salt-value'
+        salt = self._get_or_create_salt()
         kdf = PBKDF2HMAC(
             algorithm=hashes.SHA256(),
             length=32,
@@ -176,6 +182,48 @@ class DPDPAgent:
         )
         derived_key = base64.urlsafe_b64encode(kdf.derive(key.encode()))
         return Fernet(derived_key)
+
+    # Legacy static salt used before per-deployment salts were introduced.
+    # Retained only to derive the salt file location and for reference; new
+    # deployments generate a random salt stored alongside the data.
+    _LEGACY_SALT = b'dpdp-privacy-agent-v1-salt-value'
+
+    def _get_or_create_salt(self) -> bytes:
+        """Return a per-deployment random salt, creating and persisting one if absent.
+
+        The salt is stored next to the data file (e.g. data/dpdp_storage.salt).
+        If no salt file exists but a storage file already does, we fall back to the
+        legacy static salt so existing passphrase-encrypted data remains readable.
+        """
+        salt_path = self.storage_path.with_suffix('.salt')
+        try:
+            if salt_path.exists():
+                salt = salt_path.read_bytes()
+                if salt:
+                    return salt
+            # No salt file. If a data file already exists, this deployment predates
+            # per-deployment salts -> keep legacy salt for backward compatibility.
+            if self.storage_path.exists():
+                logger.warning("No salt file found but data exists; using legacy salt "
+                               "for backward compatibility. Consider re-encrypting.")
+                return self._LEGACY_SALT
+            # Fresh deployment: generate and persist a random salt.
+            salt = os.urandom(16)
+            salt_path.parent.mkdir(parents=True, exist_ok=True)
+            # Write atomically and restrict permissions where supported.
+            tmp = salt_path.with_suffix('.salt.tmp')
+            tmp.write_bytes(salt)
+            try:
+                os.chmod(tmp, 0o600)
+            except OSError:
+                pass
+            tmp.replace(salt_path)
+            logger.info("Generated new per-deployment encryption salt")
+            return salt
+        except OSError as e:
+            # If we cannot read/write the salt file, fail loud rather than silently
+            # deriving an unrecoverable key.
+            raise RuntimeError(f"Failed to read or create encryption salt at {salt_path}: {e}")
 
     def _encrypt(self, data: str) -> str:
         """Encrypt sensitive data"""
@@ -200,50 +248,82 @@ class DPDPAgent:
         return result
 
     def _load_state(self):
-        """Load persisted state from disk"""
+        """Load persisted state from disk.
+
+        A missing storage file is normal (fresh deployment) and handled silently.
+        A corrupt/unreadable file is backed up and logged loudly rather than being
+        silently discarded, so operators can investigate and recover.
+        """
         with self._lock:
+            if not self.storage_path.exists():
+                logger.info("No existing state file; starting fresh")
+                return
             try:
-                if self.storage_path.exists():
-                    with open(self.storage_path, 'r') as f:
-                        data = json.load(f)
+                with open(self.storage_path, 'r') as f:
+                    data = json.load(f)
+            except (json.JSONDecodeError, OSError) as e:
+                self._backup_corrupt_state()
+                logger.error("State file at %s is corrupt or unreadable (%s); "
+                             "backed up and starting with empty state",
+                             self.storage_path, e)
+                return
 
-                    # Load consents
-                    for user_id, consents in data.get('consents', {}).items():
-                        self.consents[user_id] = [
-                            ConsentRecord(
-                                c['user_id'], c['purpose'],
-                                ConsentStatus(c['status']),
-                                datetime.fromisoformat(c['granted_at']),
-                                datetime.fromisoformat(c['expires_at']) if c.get('expires_at') else None
-                            ) for c in consents
-                        ]
+            try:
+                # Load consents
+                for user_id, consents in data.get('consents', {}).items():
+                    self.consents[user_id] = [
+                        ConsentRecord(
+                            c['user_id'], c['purpose'],
+                            ConsentStatus(c['status']),
+                            datetime.fromisoformat(c['granted_at']),
+                            datetime.fromisoformat(c['expires_at']) if c.get('expires_at') else None
+                        ) for c in consents
+                    ]
 
-                    # Load data store - content stays ENCRYPTED in memory
-                    for user_id, items in data.get('data_store', {}).items():
-                        self.data_store[user_id] = [
-                            DataItem(
-                                i['content'],  # Keep encrypted
-                                self._parse_category(i['category']),
-                                i['user_id'],
-                                datetime.fromisoformat(i['created_at']),
-                                i['retention_days']
-                            ) for i in items
-                        ]
+                # Load data store - content stays ENCRYPTED in memory
+                for user_id, items in data.get('data_store', {}).items():
+                    self.data_store[user_id] = [
+                        DataItem(
+                            i['content'],  # Keep encrypted
+                            self._parse_category(i['category']),
+                            i['user_id'],
+                            datetime.fromisoformat(i['created_at']),
+                            i['retention_days']
+                        ) for i in items
+                    ]
 
-                    # Load audit logs
-                    for log in data.get('audit_logs', [])[-self.max_audit_logs:]:
-                        self.audit_logs.append(
-                            AuditLog(
-                                datetime.fromisoformat(log['timestamp']),
-                                log['user_id'],
-                                log['action'],
-                                log['data_category'],
-                                log['result']
-                            )
+                # Load audit logs
+                for log in data.get('audit_logs', [])[-self.max_audit_logs:]:
+                    self.audit_logs.append(
+                        AuditLog(
+                            datetime.fromisoformat(log['timestamp']),
+                            log['user_id'],
+                            log['action'],
+                            log['data_category'],
+                            log['result']
                         )
-                    logger.info("State loaded from disk")
-            except Exception as e:
-                logger.error(f"Failed to load state: {e}")
+                    )
+                logger.info("State loaded from disk")
+            except (KeyError, ValueError, TypeError) as e:
+                # Structurally valid JSON but unexpected schema -> treat as corruption.
+                self._backup_corrupt_state()
+                # Reset any partially-populated state to avoid inconsistency.
+                self.consents.clear()
+                self.data_store.clear()
+                self.audit_logs.clear()
+                logger.error("State file at %s has unexpected structure (%s); "
+                             "backed up and starting with empty state",
+                             self.storage_path, e)
+
+    def _backup_corrupt_state(self):
+        """Move a corrupt state file aside so it is not overwritten on next save."""
+        try:
+            timestamp = datetime.now().strftime('%Y%m%d%H%M%S')
+            backup = self.storage_path.with_suffix(f'.corrupt-{timestamp}.bak')
+            self.storage_path.replace(backup)
+            logger.error("Corrupt state file backed up to %s", backup)
+        except OSError as e:
+            logger.error("Failed to back up corrupt state file: %s", e)
 
     def _parse_category(self, category_str: str) -> DataCategory:
         """Parse category from string, handling both enum name and value"""
@@ -297,8 +377,8 @@ class DPDPAgent:
         self.audit_logs.append(
             AuditLog(datetime.now(), user_id, action, category, result)
         )
-        # Trim if exceeds limit
-        if len(self.audit_logs) > self.max_audit_logs * 1.5:
+        # Trim if exceeds limit (single, consistent policy with _save_state)
+        if len(self.audit_logs) > self.max_audit_logs:
             self.audit_logs = self.audit_logs[-self.max_audit_logs:]
 
     @staticmethod
@@ -464,8 +544,9 @@ class DPDPAgent:
                     )
                 if not self.check_consent(user_id, purpose):
                     with self._lock:
+                        # result must be "blocked" so detect_breach_attempt counts it
                         self._log_action(user_id, "data_store_blocked", category.value,
-                                         "no_consent")
+                                         "blocked")
                         self._save_state()
                     raise PermissionError(
                         f"No consent for storing {category.value}. "
