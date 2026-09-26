@@ -124,18 +124,26 @@ def require_api_key(f):
 
 
 def require_json(f):
-    """Validate that POST/PUT requests have application/json Content-Type and valid JSON body"""
+    """Validate that POST/PUT requests carry an application/json object body.
+
+    Enforces both a valid JSON body and that it decodes to a JSON object (dict),
+    since every endpoint expects named fields. A bare list/number/string/null body
+    is rejected with 400 rather than causing a downstream TypeError -> 500.
+    """
     @wraps(f)
     def decorated(*args, **kwargs):
         if not request.is_json:
             return jsonify({"error": "Content-Type must be application/json"}), 415
-        # Ensure the body is valid JSON (request.json returns None for parse errors
-        # in some Flask versions, or raises BadRequest in others)
+        # request.json returns None for parse errors in some Flask versions,
+        # or raises BadRequest in others.
         try:
-            if request.json is None:
-                return jsonify({"error": "Request body must be valid JSON"}), 400
+            body = request.json
         except Exception:
             return jsonify({"error": "Request body must be valid JSON"}), 400
+        if body is None:
+            return jsonify({"error": "Request body must be valid JSON"}), 400
+        if not isinstance(body, dict):
+            return jsonify({"error": "Request body must be a JSON object"}), 400
         return f(*args, **kwargs)
     return decorated
 
