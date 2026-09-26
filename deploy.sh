@@ -20,6 +20,9 @@ fi
 # Create necessary directories
 mkdir -p data logs
 
+# Direct application logs into the logs/ directory (matches mkdir above)
+export DPDP_LOG_FILE="${DPDP_LOG_FILE:-logs/dpdp_agent.log}"
+
 # Install dependencies
 pip install -r requirements.txt
 
